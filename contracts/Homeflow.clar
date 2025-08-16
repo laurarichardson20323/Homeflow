@@ -16,9 +16,19 @@
 (define-constant ERR_MORTGAGE_DEFAULTED (err u114))
 (define-constant ERR_PAYMENT_NOT_DUE (err u115))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u116))
+(define-constant ERR_INSPECTION_NOT_FOUND (err u117))
+(define-constant ERR_INSPECTOR_NOT_AUTHORIZED (err u118))
+(define-constant ERR_INSPECTION_ALREADY_EXISTS (err u119))
+(define-constant ERR_FINDING_NOT_FOUND (err u120))
+(define-constant ERR_INVALID_SEVERITY (err u121))
+(define-constant ERR_REPAIR_ALREADY_COMPLETED (err u122))
+(define-constant ERR_INSPECTION_COMPLETED (err u123))
+(define-constant ERR_FINDINGS_PENDING (err u124))
 
 (define-data-var escrow-counter uint u0)
 (define-data-var mortgage-counter uint u0)
+(define-data-var inspection-counter uint u0)
+(define-data-var finding-counter uint u0)
 
 (define-map escrows
   { escrow-id: uint }
@@ -85,6 +95,63 @@
     total-interest-paid: uint,
     total-late-fees: uint,
     escrow-balance: uint
+  }
+)
+
+(define-map inspectors
+  { inspector: principal }
+  {
+    authorized: bool,
+    license-number: (string-ascii 32),
+    specialty: (string-ascii 32),
+    rating: uint,
+    total-inspections: uint
+  }
+)
+
+(define-map property-inspections
+  { inspection-id: uint }
+  {
+    property-id: (string-ascii 64),
+    escrow-id: uint,
+    inspector: principal,
+    inspection-type: (string-ascii 32),
+    scheduled-date: uint,
+    completed-date: uint,
+    status: (string-ascii 20),
+    overall-rating: uint,
+    total-findings: uint,
+    critical-findings: uint,
+    estimated-repair-cost: uint
+  }
+)
+
+(define-map inspection-findings
+  { finding-id: uint }
+  {
+    inspection-id: uint,
+    area: (string-ascii 32),
+    finding-type: (string-ascii 32),
+    severity: uint,
+    description: (string-ascii 128),
+    estimated-cost: uint,
+    photo-hash: (string-ascii 64),
+    repair-required: bool,
+    repair-completed: bool,
+    repair-verified-by: (optional principal),
+    repair-completion-date: uint
+  }
+)
+
+(define-map inspection-reports
+  { inspection-id: uint }
+  {
+    summary: (string-ascii 256),
+    recommendations: (string-ascii 256),
+    pass-fail-status: (string-ascii 20),
+    inspector-notes: (string-ascii 128),
+    buyer-acknowledged: bool,
+    seller-acknowledged: bool
   }
 )
 
@@ -507,3 +574,278 @@
     ERR_MORTGAGE_NOT_FOUND
   )
 )
+
+(define-public (register-inspector (inspector principal) (license-number (string-ascii 32)) (specialty (string-ascii 32)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-set inspectors 
+      { inspector: inspector }
+      {
+        authorized: true,
+        license-number: license-number,
+        specialty: specialty,
+        rating: u5,
+        total-inspections: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-inspector (inspector principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (is-some (map-get? inspectors { inspector: inspector })) ERR_INSPECTOR_NOT_AUTHORIZED)
+    (map-set inspectors 
+      { inspector: inspector }
+      (merge (unwrap-panic (map-get? inspectors { inspector: inspector })) { authorized: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (schedule-inspection (property-id (string-ascii 64)) (escrow-id uint) (inspector principal) (inspection-type (string-ascii 32)) (scheduled-date uint))
+  (let
+    (
+      (inspection-id (+ (var-get inspection-counter) u1))
+      (inspector-info (unwrap! (map-get? inspectors { inspector: inspector }) ERR_INSPECTOR_NOT_AUTHORIZED))
+      (escrow (unwrap! (map-get? escrows { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (get authorized inspector-info) ERR_INSPECTOR_NOT_AUTHORIZED)
+    (asserts! (or (is-eq tx-sender (get buyer escrow)) (is-eq tx-sender (get seller escrow))) ERR_NOT_BUYER_OR_SELLER)
+    (asserts! (is-none (map-get? property-inspections { inspection-id: inspection-id })) ERR_INSPECTION_ALREADY_EXISTS)
+    
+    (map-set property-inspections
+      { inspection-id: inspection-id }
+      {
+        property-id: property-id,
+        escrow-id: escrow-id,
+        inspector: inspector,
+        inspection-type: inspection-type,
+        scheduled-date: scheduled-date,
+        completed-date: u0,
+        status: "scheduled",
+        overall-rating: u0,
+        total-findings: u0,
+        critical-findings: u0,
+        estimated-repair-cost: u0
+      }
+    )
+    
+    (var-set inspection-counter inspection-id)
+    (ok inspection-id)
+  )
+)
+
+(define-public (complete-inspection (inspection-id uint) (overall-rating uint) (summary (string-ascii 256)) (recommendations (string-ascii 256)) (pass-fail-status (string-ascii 20)))
+  (let
+    (
+      (inspection (unwrap! (map-get? property-inspections { inspection-id: inspection-id }) ERR_INSPECTION_NOT_FOUND))
+      (inspector-info (unwrap! (map-get? inspectors { inspector: (get inspector inspection) }) ERR_INSPECTOR_NOT_AUTHORIZED))
+    )
+    (asserts! (is-eq tx-sender (get inspector inspection)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status inspection) "scheduled") ERR_INSPECTION_COMPLETED)
+    (asserts! (<= overall-rating u10) ERR_INVALID_SEVERITY)
+    
+    (map-set property-inspections
+      { inspection-id: inspection-id }
+      (merge inspection {
+        completed-date: stacks-block-height,
+        status: "completed",
+        overall-rating: overall-rating
+      })
+    )
+    
+    (map-set inspection-reports
+      { inspection-id: inspection-id }
+      {
+        summary: summary,
+        recommendations: recommendations,
+        pass-fail-status: pass-fail-status,
+        inspector-notes: "",
+        buyer-acknowledged: false,
+        seller-acknowledged: false
+      }
+    )
+    
+    (map-set inspectors
+      { inspector: (get inspector inspection) }
+      (merge inspector-info { total-inspections: (+ (get total-inspections inspector-info) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (add-inspection-finding (inspection-id uint) (area (string-ascii 32)) (finding-type (string-ascii 32)) (severity uint) (description (string-ascii 128)) (estimated-cost uint) (repair-required bool))
+  (let
+    (
+      (finding-id (+ (var-get finding-counter) u1))
+      (inspection (unwrap! (map-get? property-inspections { inspection-id: inspection-id }) ERR_INSPECTION_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get inspector inspection)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= severity u1) ERR_INVALID_SEVERITY)
+    (asserts! (<= severity u5) ERR_INVALID_SEVERITY)
+    
+    (map-set inspection-findings
+      { finding-id: finding-id }
+      {
+        inspection-id: inspection-id,
+        area: area,
+        finding-type: finding-type,
+        severity: severity,
+        description: description,
+        estimated-cost: estimated-cost,
+        photo-hash: "",
+        repair-required: repair-required,
+        repair-completed: false,
+        repair-verified-by: none,
+        repair-completion-date: u0
+      }
+    )
+    
+    (let
+      (
+        (current-total (get total-findings inspection))
+        (current-critical (get critical-findings inspection))
+        (current-cost (get estimated-repair-cost inspection))
+        (new-critical (if (>= severity u4) (+ current-critical u1) current-critical))
+      )
+      (map-set property-inspections
+        { inspection-id: inspection-id }
+        (merge inspection {
+          total-findings: (+ current-total u1),
+          critical-findings: new-critical,
+          estimated-repair-cost: (+ current-cost estimated-cost)
+        })
+      )
+    )
+    
+    (var-set finding-counter finding-id)
+    (ok finding-id)
+  )
+)
+
+(define-public (mark-repair-completed (finding-id uint) (verifier principal))
+  (let
+    (
+      (finding (unwrap! (map-get? inspection-findings { finding-id: finding-id }) ERR_FINDING_NOT_FOUND))
+      (inspection (unwrap! (map-get? property-inspections { inspection-id: (get inspection-id finding) }) ERR_INSPECTION_NOT_FOUND))
+      (escrow (unwrap! (map-get? escrows { escrow-id: (get escrow-id inspection) }) ERR_ESCROW_NOT_FOUND))
+      (verifier-info (default-to { authorized: false } (map-get? verifiers { verifier: verifier })))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get buyer escrow))
+      (is-eq tx-sender (get seller escrow))
+      (and (is-eq tx-sender verifier) (get authorized verifier-info))
+    ) ERR_NOT_AUTHORIZED)
+    (asserts! (get repair-required finding) ERR_REPAIR_ALREADY_COMPLETED)
+    (asserts! (not (get repair-completed finding)) ERR_REPAIR_ALREADY_COMPLETED)
+    
+    (map-set inspection-findings
+      { finding-id: finding-id }
+      (merge finding {
+        repair-completed: true,
+        repair-verified-by: (some verifier),
+        repair-completion-date: stacks-block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (acknowledge-inspection-report (inspection-id uint) (is-buyer bool))
+  (let
+    (
+      (inspection (unwrap! (map-get? property-inspections { inspection-id: inspection-id }) ERR_INSPECTION_NOT_FOUND))
+      (escrow (unwrap! (map-get? escrows { escrow-id: (get escrow-id inspection) }) ERR_ESCROW_NOT_FOUND))
+      (report (unwrap! (map-get? inspection-reports { inspection-id: inspection-id }) ERR_INSPECTION_NOT_FOUND))
+    )
+    (if is-buyer
+      (begin
+        (asserts! (is-eq tx-sender (get buyer escrow)) ERR_NOT_AUTHORIZED)
+        (map-set inspection-reports
+          { inspection-id: inspection-id }
+          (merge report { buyer-acknowledged: true })
+        )
+      )
+      (begin
+        (asserts! (is-eq tx-sender (get seller escrow)) ERR_NOT_AUTHORIZED)
+        (map-set inspection-reports
+          { inspection-id: inspection-id }
+          (merge report { seller-acknowledged: true })
+        )
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-inspector-rating (inspector principal) (new-rating uint))
+  (let
+    (
+      (inspector-info (unwrap! (map-get? inspectors { inspector: inspector }) ERR_INSPECTOR_NOT_AUTHORIZED))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rating u10) ERR_INVALID_SEVERITY)
+    
+    (map-set inspectors
+      { inspector: inspector }
+      (merge inspector-info { rating: new-rating })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-inspector-info (inspector principal))
+  (map-get? inspectors { inspector: inspector })
+)
+
+(define-read-only (get-property-inspection (inspection-id uint))
+  (map-get? property-inspections { inspection-id: inspection-id })
+)
+
+(define-read-only (get-inspection-report (inspection-id uint))
+  (map-get? inspection-reports { inspection-id: inspection-id })
+)
+
+(define-read-only (get-inspection-finding (finding-id uint))
+  (map-get? inspection-findings { finding-id: finding-id })
+)
+
+(define-read-only (get-inspection-count)
+  (var-get inspection-counter)
+)
+
+(define-read-only (get-finding-count)
+  (var-get finding-counter)
+)
+
+(define-read-only (is-inspector-authorized (inspector principal))
+  (match (map-get? inspectors { inspector: inspector })
+    inspector-info (get authorized inspector-info)
+    false
+  )
+)
+
+(define-read-only (get-escrow-inspections (escrow-id uint))
+  (let
+    (
+      (inspection-count (var-get inspection-counter))
+    )
+    (ok escrow-id)
+  )
+)
+
+(define-read-only (are-critical-repairs-completed (inspection-id uint))
+  (let
+    (
+      (inspection (unwrap! (map-get? property-inspections { inspection-id: inspection-id }) (err false)))
+      (finding-count (var-get finding-counter))
+    )
+    (ok true)
+  )
+)
+
+
