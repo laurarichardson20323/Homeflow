@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Homeflow.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.property-appraisal]
+path = 'contracts/property-appraisal.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
